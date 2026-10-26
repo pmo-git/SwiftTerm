@@ -493,6 +493,25 @@ public class LocalProcess {
     }
     #endif
     
+    // Per-instance seam for exercising fcntl failures without changing process-wide state.
+    var masterDescriptorControl: (Int32, Int32, Int32) -> Int32 = { fd, command, value in
+        fcntl(fd, command, value)
+    }
+
+    private func protectMasterDescriptor(_ fd: Int32) -> Bool {
+        var flags: Int32
+        repeat {
+            flags = masterDescriptorControl(fd, F_GETFD, 0)
+        } while flags == -1 && errno == EINTR
+        guard flags != -1 else { return false }
+
+        var result: Int32
+        repeat {
+            result = masterDescriptorControl(fd, F_SETFD, flags | FD_CLOEXEC)
+        } while result == -1 && errno == EINTR
+        return result != -1
+    }
+
     private func startProcessWithForkpty(executable: String, args: [String], environment: [String]?, execName: String?, currentDirectory: String?) {
         var size = delegate?.getWindowSize () ?? winsize()
     
@@ -511,6 +530,24 @@ public class LocalProcess {
         }
 
         if let (shellPid, childfd) = PseudoTerminalHelpers.fork(andExec: executable, args: shellArgs, env: env, currentDirectory: currentDirectory, desiredWindowSize: &size) {
+            // The master is still private: protect it before publishing state,
+            // invoking callbacks, or transferring its lifetime to DispatchIO.
+            // forkpty cannot set this atomically; a concurrent fork before this
+            // fcntl succeeds can still inherit an unprotected copy.
+            guard protectMasterDescriptor(childfd) else {
+                let protectionError = errno
+                // No DispatchIO or process monitor owns these resources yet.
+                // Do not retry close: the descriptor number could be reused.
+                close(childfd)
+                // SIGKILL also handles a child that ignores ordinary termination.
+                kill(shellPid, SIGKILL)
+                var status: Int32 = 0
+                while waitpid(shellPid, &status, 0) == -1 && errno == EINTR {}
+                delegate?.processTerminated(self, exitCode: nil)
+                print("Failed to protect pseudo-terminal master, errno=\(protectionError)")
+                return
+            }
+
             // Publish process state before arming the exit source below. The
             // source's event handler (installed just below) can be invoked
             // synchronously by activate() when the child has already exited,
